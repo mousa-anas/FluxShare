@@ -17,5 +17,8 @@ sealed class FluxShareError(message: String) : Exception(message) {
 
     data object StorageUnavailable : FluxShareError("The file could not be read or written.")
 
+    /** A peer sent bytes that do not satisfy the FluxShare protocol. */
+    data class ProtocolViolation(val detail: String) : FluxShareError("Protocol violation: $detail")
+
     data class Unexpected(val detail: String) : FluxShareError(detail)
 }

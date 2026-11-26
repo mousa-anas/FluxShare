@@ -24,6 +24,7 @@ rootProject.name = "FluxShare"
 
 include(":app")
 include(":core")
+include(":protocol")
 include(":transport")
 include(":discovery")
 include(":security")

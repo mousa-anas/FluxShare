@@ -10,4 +10,9 @@ package app.fluxshare.transport
 data class TransportEndpoint(
     val host: String,
     val port: Int,
-)
+) {
+    init {
+        require(host.isNotBlank()) { "Endpoint host must not be blank" }
+        require(port in 0..65535) { "Endpoint port must be in 0..65535, was $port" }
+    }
+}
