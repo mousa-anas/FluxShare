@@ -87,6 +87,38 @@ class FrameCodecTest {
     }
 
     @Test
+    fun `transfer complete frame round trips`() {
+        val decoded = FluxFrameCodec.decode(
+            FluxFrameCodec.encode(FluxFrame.TransferComplete(transferId)),
+        )
+        assertEquals(transferId, (decoded as FluxFrame.TransferComplete).transferId)
+    }
+
+    @Test
+    fun `transfer complete frame rejects trailing bytes and invalid identifiers`() {
+        val encoded = FluxFrameCodec.encode(FluxFrame.TransferComplete(transferId))
+        assertFailsWith<FluxShareError.ProtocolViolation> {
+            FluxFrameCodec.decode(encoded + byteArrayOf(0))
+        }
+
+        val blank = PayloadWriter().apply {
+            writeString("", ProtocolLimits.MAX_TRANSFER_ID_BYTES, "transfer identifier")
+        }.toByteArray()
+        assertFailsWith<FluxShareError.ProtocolViolation> {
+            FluxFrameCodec.decode(
+                header(typeId = FrameType.TRANSFER_COMPLETE.id, payloadLength = blank.size) + blank,
+            )
+        }
+
+        val truncated = PayloadWriter().apply { writeU16(8) }.toByteArray()
+        assertFailsWith<FluxShareError.ProtocolViolation> {
+            FluxFrameCodec.decode(
+                header(typeId = FrameType.TRANSFER_COMPLETE.id, payloadLength = truncated.size) + truncated,
+            )
+        }
+    }
+
+    @Test
     fun `rejects a bad magic`() {
         val bytes = FluxFrameCodec.encode(hello())
         bytes[0] = 'X'.code.toByte()

@@ -29,13 +29,19 @@ import java.util.concurrent.ConcurrentHashMap
  *
  * The engine streams each file from a [FileSource] into a reusable buffer, so a
  * file is never held in memory, and hashes it while sending. One
- * `FILE_DIGEST` frame closes every file; the receiver verifies it.
+ * `FILE_DIGEST` frame closes every file; the receiver verifies it and answers
+ * with `TRANSFER_COMPLETE` once all files are verified.
  *
  * Lifecycle: [execute] emits `CONNECTING`, `AWAITING_APPROVAL`,
  * `TRANSFERRING` and finally `COMPLETED`, `FAILED` or `CANCELLED`. A failed
  * transfer emits its final `FAILED` sample and then throws the
  * [FluxShareError]; a cancelled one only emits `CANCELLED`, so callers can
  * distinguish the two without treating cancellation as an error.
+ *
+ * Waiting is bounded: [approvalTimeoutMillis] covers the receiver's decision
+ * and [dataIdleTimeoutMillis] covers the final acknowledgement. On expiry the
+ * session is closed (a blocking socket read ignores cancellation) and the
+ * transfer fails with [FluxShareError.PeerUnavailable].
  *
  * **Security:** the protocol and the TCP transport are neither encrypted nor
  * authenticated. Do not use them on untrusted networks.
@@ -46,10 +52,21 @@ class DefaultTransferEngine(
     private val localDevice: PeerDevice,
     private val endpoints: PeerEndpointResolver,
     chunkSizeBytes: Int = TransferChunking.DEFAULT_CHUNK_SIZE_BYTES,
+    private val approvalTimeoutMillis: Long = DEFAULT_APPROVAL_TIMEOUT_MILLIS,
+    private val dataIdleTimeoutMillis: Long = DEFAULT_DATA_IDLE_TIMEOUT_MILLIS,
 ) : TransferEngine {
 
     private val chunkSizeBytes: Int = TransferChunking.requireValid(chunkSizeBytes)
     private val active = ConcurrentHashMap<TransferId, ActiveTransfer>()
+
+    init {
+        require(approvalTimeoutMillis > 0) {
+            "approvalTimeoutMillis must be positive, was $approvalTimeoutMillis"
+        }
+        require(dataIdleTimeoutMillis > 0) {
+            "dataIdleTimeoutMillis must be positive, was $dataIdleTimeoutMillis"
+        }
+    }
 
     override fun execute(request: TransferRequest): Flow<TransferProgress> {
         require(request.direction == TransferDirection.SEND) {
@@ -71,8 +88,9 @@ class DefaultTransferEngine(
             val job = launch(start = CoroutineStart.LAZY) {
                 var session: TransportSession? = null
                 try {
-                    session = connect(request, reporter, entry)
-                    val stream = FluxFrameStream(session)
+                    val connected = connect(request, reporter, entry)
+                    session = connected
+                    val stream = FluxFrameStream(connected)
 
                     stream.write(FluxFrame.Hello(localDevice))
 
@@ -89,23 +107,23 @@ class DefaultTransferEngine(
                     stream.write(FluxFrame.Manifest(manifest))
 
                     reporter.emit(TransferState.AWAITING_APPROVAL)
-                    awaitApproval(stream, transferId)
+                    awaitApproval(stream, connected, transferId)
 
                     reporter.emit(TransferState.TRANSFERRING)
                     sendFiles(stream, request.files, reporter)
 
-                    awaitOutcome(stream)
+                    awaitOutcome(stream, connected, transferId)
                     // An explicit cancel() may have closed the session between the
                     // last read and here; that is a cancellation, not a success.
                     if (entry.cancelled) throw CancellationException("Transfer was cancelled")
                     reporter.emit(TransferState.COMPLETED)
                 } catch (e: CancellationException) {
                     reporter.emitTerminal(TransferState.CANCELLED)
-                } catch (e: FluxShareError) {
+                } catch (e: Exception) {
                     if (entry.cancelled) {
                         reporter.emitTerminal(TransferState.CANCELLED)
                     } else {
-                        failure = e
+                        failure = e.toTransferFailure()
                         reporter.emit(TransferState.FAILED)
                     }
                 } finally {
@@ -162,8 +180,12 @@ class DefaultTransferEngine(
         return session
     }
 
-    private suspend fun awaitApproval(stream: FluxFrameStream, transferId: TransferId) {
-        val response = stream.read()
+    private suspend fun awaitApproval(
+        stream: FluxFrameStream,
+        session: TransportSession,
+        transferId: TransferId,
+    ) {
+        val response = withTransferTimeout(approvalTimeoutMillis, session) { stream.read() }
             ?: throw FluxShareError.Unexpected(
                 "The receiver closed the session before answering the manifest.",
             )
@@ -189,12 +211,12 @@ class DefaultTransferEngine(
         val buffer = ByteArray(chunkSizeBytes)
         files.forEachIndexed { index, file ->
             val source = openSource(file)
-            try {
+            withStorageClose(close = { source.close() }) {
                 val digest = IncrementalSha256()
                 var offset = 0L
                 while (offset < file.sizeBytes) {
                     val wanted = minOf(chunkSizeBytes.toLong(), file.sizeBytes - offset).toInt()
-                    val read = source.read(buffer, offset = 0, length = wanted)
+                    val read = storageCall { source.read(buffer, offset = 0, length = wanted) }
                     if (read < 0) {
                         throw FluxShareError.Unexpected(
                             "File \"${file.name}\" ended after $offset of ${file.sizeBytes} bytes.",
@@ -223,26 +245,50 @@ class DefaultTransferEngine(
                     reporter.advance(read.toLong())
                 }
                 stream.write(FluxFrame.FileDigest(fileIndex = index, sha256 = digest.digest()))
-            } finally {
-                source.close()
             }
         }
     }
 
-    /** Waits for the receiver's verdict: only a clean close means success. */
-    private suspend fun awaitOutcome(stream: FluxFrameStream) {
-        when (val last = stream.read()) {
-            null -> Unit
+    /** Waits for the receiver's verification: only a matching confirmation is success. */
+    private suspend fun awaitOutcome(
+        stream: FluxFrameStream,
+        session: TransportSession,
+        transferId: TransferId,
+    ) {
+        val last = withTransferTimeout(dataIdleTimeoutMillis, session) { stream.read() }
+            ?: throw FluxShareError.Unexpected(
+                "The receiver closed the session without confirmation.",
+            )
+        when (last) {
+            is FluxFrame.TransferComplete -> {
+                if (last.transferId != transferId) {
+                    throw FluxShareError.ProtocolViolation(
+                        "The receiver confirmed transfer ${last.transferId.value}, not ${transferId.value}.",
+                    )
+                }
+            }
+
             is FluxFrame.Error -> throw last.toTransferError()
+
             else -> throw FluxShareError.ProtocolViolation(
-                "The receiver sent ${frameName(last)} instead of closing the session.",
+                "The receiver sent ${frameName(last)} instead of confirming the transfer.",
             )
         }
     }
 
     private suspend fun openSource(file: TransferFile): FileSource =
-        when (val opened = storage.openSource(file)) {
-            is FluxShareResult.Success -> opened.value
-            is FluxShareResult.Failure -> throw opened.error
+        storageCall {
+            when (val opened = storage.openSource(file)) {
+                is FluxShareResult.Success -> opened.value
+                is FluxShareResult.Failure -> throw opened.error
+            }
         }
+
+    companion object {
+        /** A human is deciding whether to accept, so this is generous. */
+        const val DEFAULT_APPROVAL_TIMEOUT_MILLIS: Long = 5 * 60 * 1_000L
+
+        /** Longest silence tolerated while waiting for the final confirmation. */
+        const val DEFAULT_DATA_IDLE_TIMEOUT_MILLIS: Long = 30 * 1_000L
+    }
 }

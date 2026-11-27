@@ -7,7 +7,9 @@ import app.fluxshare.core.FluxShareResult
 import app.fluxshare.core.PeerDevice
 import app.fluxshare.core.TransferId
 import app.fluxshare.protocol.FluxFrame
+import app.fluxshare.protocol.FluxFrameCodec
 import app.fluxshare.protocol.FluxFrameStream
+import app.fluxshare.protocol.FrameType
 import app.fluxshare.protocol.FluxManifest
 import app.fluxshare.protocol.IncrementalSha256
 import app.fluxshare.protocol.ManifestEntry
@@ -58,6 +60,11 @@ internal class Peer(val session: TransportSession) {
 
     suspend fun offer(manifest: FluxManifest) {
         stream.write(FluxFrame.Manifest(manifest))
+    }
+
+    /** Confirms a verified transfer, as a real receiver does after the last digest. */
+    suspend fun confirm(manifest: FluxManifest) {
+        stream.write(FluxFrame.TransferComplete(manifest.transferId))
     }
 
     suspend inline fun <reified T : FluxFrame> expectFrame(): T {
@@ -187,6 +194,29 @@ internal fun entryOf(
 /** Deterministic, non-repeating-per-file payload. */
 internal fun patterned(size: Int, seed: Int = 0): ByteArray =
     ByteArray(size) { index -> ((index * 31 + seed * 17) % 251).toByte() }
+
+/** Builds a complete frame from raw payload bytes, for malformed-wire tests. */
+internal fun rawFrame(typeId: Int, payload: ByteArray): ByteArray {
+    val header = java.nio.ByteBuffer.allocate(ProtocolLimits.FRAME_HEADER_BYTES)
+        .order(java.nio.ByteOrder.BIG_ENDIAN)
+        .putInt(FluxFrameCodec.MAGIC)
+        .put(FluxFrameCodec.VERSION.toByte())
+        .put(typeId.toByte())
+        .putShort(0)
+        .putInt(payload.size)
+        .array()
+    return header + payload
+}
+
+/** A syntactically valid DATA frame header with no content bytes. */
+internal fun emptyDataFrame(): ByteArray {
+    val payload = java.nio.ByteBuffer.allocate(12)
+        .order(java.nio.ByteOrder.BIG_ENDIAN)
+        .putInt(0)
+        .putLong(0L)
+        .array()
+    return rawFrame(FrameType.DATA.id, payload)
+}
 
 /** Collapses runs of identical states, which is how a UI would show transitions. */
 internal fun List<TransferProgress>.states(): List<TransferState> {

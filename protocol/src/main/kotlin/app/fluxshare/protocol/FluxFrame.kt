@@ -61,6 +61,16 @@ sealed interface FluxFrame {
         val sha256: ByteArray,
     ) : FluxFrame
 
+    /**
+     * The receiving side verified every file of [transferId].
+     *
+     * Sent after the last `FILE_DIGEST`. The sender reports success only when
+     * this frame arrives; a session that closes without it failed.
+     */
+    data class TransferComplete(
+        val transferId: TransferId,
+    ) : FluxFrame
+
     /** A recoverable protocol or transfer error. */
     data class Error(
         val code: ProtocolErrorCode,

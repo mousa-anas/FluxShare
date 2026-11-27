@@ -11,7 +11,6 @@ import app.fluxshare.protocol.ProtocolErrorCode
 import app.fluxshare.storage.FileSink
 import app.fluxshare.storage.StorageProvider
 import app.fluxshare.storage.TransferFile
-import app.fluxshare.transport.Transport
 import app.fluxshare.transport.TransportListener
 import app.fluxshare.transport.TransportSession
 import kotlinx.coroutines.CancellationException
@@ -25,7 +24,7 @@ import kotlinx.coroutines.withContext
 import java.util.concurrent.atomic.AtomicReference
 
 /**
- * Receives files from one sending FluxShare device.
+ * Receives files from one sending FluxShare device over an accepted session.
  *
  * The frame sequence is validated before anything is written: the sender's
  * `HELLO` and `MANIFEST` are read, the manifest is validated by the protocol
@@ -35,7 +34,14 @@ import java.util.concurrent.atomic.AtomicReference
  * Every file is streamed into a [FileSink] from the [StorageProvider] while its
  * SHA-256 digest is computed, and the digest is compared with the sender's
  * `FILE_DIGEST` (and the manifest digest when the sender supplied one). A
- * mismatch sends `ERROR(CHECKSUM_MISMATCH)` and fails the transfer.
+ * mismatch sends `ERROR(CHECKSUM_MISMATCH)` and fails the transfer. After all
+ * files are verified the receiver sends `TRANSFER_COMPLETE`, then closes the
+ * session.
+ *
+ * Waiting is bounded: [handshakeTimeoutMillis] covers `HELLO`/`MANIFEST` and
+ * [dataIdleTimeoutMillis] covers each wait for the next frame. The time spent in
+ * [onApproval] is not counted. On expiry the session is closed and the transfer
+ * fails with [FluxShareError.PeerUnavailable].
  *
  * Cancelling the collecting coroutine closes the session, which unblocks a
  * pending read, and closes the open sink. Partial files are not deleted because
@@ -45,23 +51,19 @@ import java.util.concurrent.atomic.AtomicReference
  * authenticated. Do not use them on untrusted networks.
  */
 class TransferReceiver(
-    private val transport: Transport,
     private val storage: StorageProvider,
+    private val handshakeTimeoutMillis: Long = DEFAULT_HANDSHAKE_TIMEOUT_MILLIS,
+    private val dataIdleTimeoutMillis: Long = DEFAULT_DATA_IDLE_TIMEOUT_MILLIS,
 ) {
-    /**
-     * Listens on [port] (`0` for an ephemeral port) and receives one transfer.
-     *
-     * The listener this flow creates is closed when the transfer ends.
-     */
-    fun receive(
-        port: Int = 0,
-        onApproval: suspend (IncomingTransfer) -> TransferDecision,
-    ): Flow<TransferProgress> = receiveFlow(
-        onApproval = onApproval,
-        suppliedListener = null,
-        openListener = { transport.listen(port) },
-        ownsListener = true,
-    )
+
+    init {
+        require(handshakeTimeoutMillis > 0) {
+            "handshakeTimeoutMillis must be positive, was $handshakeTimeoutMillis"
+        }
+        require(dataIdleTimeoutMillis > 0) {
+            "dataIdleTimeoutMillis must be positive, was $dataIdleTimeoutMillis"
+        }
+    }
 
     /**
      * Receives one transfer over an already listening [listener].
@@ -72,38 +74,25 @@ class TransferReceiver(
     fun receive(
         listener: TransportListener,
         onApproval: suspend (IncomingTransfer) -> TransferDecision,
-    ): Flow<TransferProgress> = receiveFlow(
-        onApproval = onApproval,
-        suppliedListener = listener,
-        openListener = null,
-        ownsListener = false,
-    )
-
-    private fun receiveFlow(
-        onApproval: suspend (IncomingTransfer) -> TransferDecision,
-        suppliedListener: TransportListener?,
-        openListener: (suspend () -> FluxShareResult<TransportListener>)?,
-        ownsListener: Boolean,
     ): Flow<TransferProgress> = channelFlow {
         val out = channel
         val sessionRef = AtomicReference<TransportSession?>(null)
         val sinkRef = AtomicReference<FileSink?>(null)
-        var listenerRef: TransportListener? = null
         var reporter: TransferProgressReporter? = null
         var failure: FluxShareError? = null
 
         val job = launch(start = CoroutineStart.LAZY) {
-            var stream: FluxFrameStream? = null
             try {
-                val listener = suppliedListener ?: openListener!!.invoke().orThrow()
-                listenerRef = listener
-
                 val session = listener.accept().orThrow()
                 sessionRef.set(session)
-                stream = FluxFrameStream(session)
+                val stream = FluxFrameStream(session)
 
-                val hello = stream.readExpecting<FluxFrame.Hello>("a hello frame")
-                val manifest = stream.readExpecting<FluxFrame.Manifest>("a manifest frame").manifest
+                val hello = withTransferTimeout(handshakeTimeoutMillis, session) {
+                    stream.readExpecting<FluxFrame.Hello>("a hello frame")
+                }
+                val manifest = withTransferTimeout(handshakeTimeoutMillis, session) {
+                    stream.readExpecting<FluxFrame.Manifest>("a manifest frame").manifest
+                }
 
                 val progress = TransferProgressReporter(
                     out = out,
@@ -115,6 +104,7 @@ class TransferReceiver(
                 progress.emit(TransferState.CONNECTING)
                 progress.emit(TransferState.AWAITING_APPROVAL)
 
+                // Deliberately outside every timeout: a human is deciding.
                 val decision = onApproval(
                     IncomingTransfer(
                         peer = hello.peer,
@@ -128,7 +118,9 @@ class TransferReceiver(
                             FluxFrame.ManifestResponse(manifest.transferId, accepted = true),
                         )
                         progress.emit(TransferState.TRANSFERRING)
-                        receiveFiles(stream, manifest, progress, sinkRef)
+                        receiveFiles(stream, session, manifest, progress, sinkRef)
+                        // The sender only reports success after this frame.
+                        stream.write(FluxFrame.TransferComplete(manifest.transferId))
                         progress.emit(TransferState.COMPLETED)
                     }
 
@@ -145,45 +137,31 @@ class TransferReceiver(
                 }
             } catch (e: CancellationException) {
                 reporter?.emitTerminal(TransferState.CANCELLED)
-            } catch (e: ReceiverFailure) {
-                replyWithError(sessionRef.get(), e.reply, e.error.message)
-                failure = e.error
-                reporter?.emit(TransferState.FAILED)
-            } catch (e: FluxShareError) {
-                // Malformed or out-of-sequence frames are reported to the peer
+            } catch (e: Exception) {
+                val (error, reply) = e.toReceiverFailure()
+                // Malformed frames and storage failures are reported to the peer
                 // when the session still allows writing.
-                replyWithError(sessionRef.get(), ProtocolErrorCode.PROTOCOL_VIOLATION, e.message)
-                failure = e
+                replyWithError(sessionRef.get(), reply, error.message)
+                failure = error
                 reporter?.emit(TransferState.FAILED)
             } finally {
                 withContext(NonCancellable) {
                     sinkRef.get()?.let { sink -> runCatching { sink.close() } }
                     sinkRef.set(null)
                     sessionRef.get()?.let { session -> runCatching { session.close() } }
-                    if (ownsListener) {
-                        listenerRef?.let { listener -> runCatching { listener.close() } }
-                    }
                 }
             }
         }
 
+        job.start()
         try {
-            job.start()
-            try {
-                job.join()
-            } finally {
-                // Closing the session here unblocks a pending read before the
-                // worker is awaited; blocking socket I/O ignores cancellation alone.
-                withContext(NonCancellable) {
-                    sessionRef.get()?.let { session -> runCatching { session.close() } }
-                    job.cancelAndJoin()
-                }
-            }
+            job.join()
         } finally {
-            if (ownsListener) {
-                withContext(NonCancellable) {
-                    listenerRef?.let { listener -> runCatching { listener.close() } }
-                }
+            // Closing the session here unblocks a pending read before the worker
+            // is awaited; blocking socket I/O ignores cancellation alone.
+            withContext(NonCancellable) {
+                sessionRef.get()?.let { session -> runCatching { session.close() } }
+                job.cancelAndJoin()
             }
         }
 
@@ -192,6 +170,7 @@ class TransferReceiver(
 
     private suspend fun receiveFiles(
         stream: FluxFrameStream,
+        session: TransportSession,
         manifest: FluxManifest,
         reporter: TransferProgressReporter,
         sinkRef: AtomicReference<FileSink?>,
@@ -210,10 +189,12 @@ class TransferReceiver(
                 sizeBytes = entry.sizeBytes,
                 mimeType = entry.mimeType,
             )
-            val created = when (val opened = storage.createSink(file)) {
-                is FluxShareResult.Success -> opened.value
-                is FluxShareResult.Failure ->
-                    throw ReceiverFailure(opened.error, ProtocolErrorCode.TRANSFER_FAILED)
+            val created = storageCall {
+                when (val opened = storage.createSink(file)) {
+                    is FluxShareResult.Success -> opened.value
+                    is FluxShareResult.Failure ->
+                        throw ReceiverFailure(opened.error, ProtocolErrorCode.TRANSFER_FAILED)
+                }
             }
             sink = created
             sinkRef.set(created)
@@ -222,12 +203,13 @@ class TransferReceiver(
 
         while (index < manifest.files.size) {
             val entry = manifest.files[index]
-            val frame = stream.read() ?: throw ReceiverFailure(
-                FluxShareError.Unexpected(
-                    "The sender disconnected after $index of ${manifest.files.size} files.",
-                ),
-                reply = null,
-            )
+            val frame = withTransferTimeout(dataIdleTimeoutMillis, session) { stream.read() }
+                ?: throw ReceiverFailure(
+                    FluxShareError.Unexpected(
+                        "The sender disconnected after $index of ${manifest.files.size} files.",
+                    ),
+                    reply = null,
+                )
 
             when (frame) {
                 is FluxFrame.Data -> {
@@ -235,6 +217,14 @@ class TransferReceiver(
                         throw ReceiverFailure(
                             FluxShareError.ProtocolViolation(
                                 "Data for file ${frame.fileIndex} arrived while file $index was expected.",
+                            ),
+                            ProtocolErrorCode.PROTOCOL_VIOLATION,
+                        )
+                    }
+                    if (frame.bytes.isEmpty()) {
+                        throw ReceiverFailure(
+                            FluxShareError.ProtocolViolation(
+                                "File \"${entry.name}\" received an empty data frame.",
                             ),
                             ProtocolErrorCode.PROTOCOL_VIOLATION,
                         )
@@ -257,7 +247,7 @@ class TransferReceiver(
                     }
 
                     val target = sink ?: openSink(entry)
-                    target.write(frame.bytes)
+                    storageCall { target.write(frame.bytes) }
                     hasher.update(frame.bytes)
                     offset += frame.bytes.size
                     reporter.advance(frame.bytes.size.toLong())
@@ -302,7 +292,7 @@ class TransferReceiver(
                         }
                     }
 
-                    target.close()
+                    storageCall { target.close() }
                     sink = null
                     sinkRef.set(null)
                     index++
@@ -329,5 +319,13 @@ class TransferReceiver(
     ) {
         if (code == null || session == null || !session.isOpen) return
         FluxFrameStream(session).writeErrorQuietly(code, message)
+    }
+
+    companion object {
+        /** Time allowed for `HELLO` and `MANIFEST` after a session is accepted. */
+        const val DEFAULT_HANDSHAKE_TIMEOUT_MILLIS: Long = 15 * 1_000L
+
+        /** Longest silence tolerated while waiting for the next file frame. */
+        const val DEFAULT_DATA_IDLE_TIMEOUT_MILLIS: Long = 30 * 1_000L
     }
 }

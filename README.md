@@ -33,7 +33,9 @@ Every frame is a 12-byte header followed by a payload:
 magic "FLXS" | version (u8) | type (u8) | flags (u16) | payload length (u32) | payload
 ```
 
-Payloads are capped at 8 MiB. Frame types: `HELLO`, `MANIFEST`, `MANIFEST_RESPONSE`, `DATA`, `FILE_DIGEST`, `ERROR`. Every field is length-prefixed and bounds-checked; invalid UTF-8, unknown types, unknown flags and truncated or oversized frames are rejected as `FluxShareError.ProtocolViolation`.
+Payloads are capped at 8 MiB. Frame types: `HELLO`, `MANIFEST`, `MANIFEST_RESPONSE`, `DATA`, `FILE_DIGEST`, `ERROR`, `TRANSFER_COMPLETE`. Every field is length-prefixed and bounds-checked; invalid UTF-8, unknown types, unknown flags and truncated or oversized frames are rejected as `FluxShareError.ProtocolViolation`.
+
+`TRANSFER_COMPLETE` carries the transfer identifier and confirms that the receiver verified every file. The sender reports success only after it arrives; a session that closes after the last `FILE_DIGEST` without it counts as a failure.
 
 Manifests describe flat file names only. Absolute paths, path separators, `.`/`..`, control characters, non-portable Windows characters, Windows reserved device names, duplicates (case-insensitive and Unicode-normalized) and size overflow are rejected so a receiver can never be tricked into writing outside its destination directory.
 
@@ -44,11 +46,11 @@ Manifests describe flat file names only. Absolute paths, path separators, `.`/`.
 - No compression, resumption, keepalive, or application-level flow control beyond TCP.
 - Directories and nested paths are not supported in manifests.
 - Only the JVM-side TCP transport exists; Android integration (foreground service, discovery) comes later.
-- The sender-side transfer engine is not implemented yet, so these modules are currently exercised by JVM tests rather than by the app UI.
+- The `:transfer` module implements the sender and receiver engines, but the app UI does not drive them yet; they are currently exercised by JVM tests.
 
 ### Tests
 
-Focused JVM tests live in `protocol/src/test` and `transport/src/test` and run with `./gradlew :protocol:test :transport:test`.
+Focused JVM tests live in `protocol/src/test`, `transport/src/test` and `transfer/src/test` and run with `./gradlew :protocol:test :transport:test :transfer:test`.
 
 ## License
 

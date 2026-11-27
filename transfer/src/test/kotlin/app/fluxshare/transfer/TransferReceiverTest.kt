@@ -15,6 +15,7 @@ import kotlinx.coroutines.flow.toList
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
+import java.io.IOException
 import kotlin.test.Test
 import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
@@ -26,7 +27,7 @@ import kotlin.test.assertTrue
 class TransferReceiverTest {
 
     @Test
-    fun `receives multiple files after approval and completes`() = runBlocking {
+    fun `receives multiple files then confirms and closes`() = runBlocking {
         withTimeout(20_000) {
             val transport = TcpTransport()
             val listener = transport.listen(0).requireSuccess("listen")
@@ -50,6 +51,9 @@ class TransferReceiverTest {
                     contents.forEachIndexed { index, bytes ->
                         remote.sendBytes(index, bytes, chunkSize = 1024)
                     }
+
+                    val complete = remote.expectFrame<FluxFrame.TransferComplete>()
+                    assertEquals(manifest.transferId, complete.transferId)
                     assertNull(
                         remote.stream.read(),
                         "the receiver must close the session when it is done",
@@ -57,7 +61,7 @@ class TransferReceiverTest {
                 }
 
                 val progress = async(Dispatchers.IO) {
-                    TransferReceiver(transport, storage)
+                    TransferReceiver(storage)
                         .receive(listener) { incoming ->
                             assertEquals(manifest.transferId, incoming.transferId)
                             assertEquals(REMOTE_DEVICE.displayName, incoming.peer.displayName)
@@ -113,7 +117,7 @@ class TransferReceiverTest {
 
                 val progress = mutableListOf<TransferProgress>()
                 assertFailsWith<FluxShareError.TransferRejected> {
-                    TransferReceiver(transport, storage)
+                    TransferReceiver(storage)
                         .receive(listener) { TransferDecision.Reject("no space") }
                         .collect { progress += it }
                 }
@@ -148,7 +152,7 @@ class TransferReceiverTest {
 
                 val progress = mutableListOf<TransferProgress>()
                 assertFailsWith<FluxShareError.Unexpected> {
-                    TransferReceiver(transport, storage)
+                    TransferReceiver(storage)
                         .receive(listener) { TransferDecision.Accept }
                         .collect { progress += it }
                 }
@@ -189,7 +193,7 @@ class TransferReceiverTest {
                 }
 
                 assertFailsWith<FluxShareError.Unexpected> {
-                    TransferReceiver(transport, storage)
+                    TransferReceiver(storage)
                         .receive(listener) { TransferDecision.Accept }
                         .toList()
                 }
@@ -219,7 +223,7 @@ class TransferReceiverTest {
 
                 val progress = mutableListOf<TransferProgress>()
                 assertFailsWith<FluxShareError> {
-                    TransferReceiver(transport, storage)
+                    TransferReceiver(storage)
                         .receive(listener) { TransferDecision.Accept }
                         .collect { progress += it }
                 }
@@ -257,7 +261,7 @@ class TransferReceiverTest {
                 }
 
                 assertFailsWith<FluxShareError.ProtocolViolation> {
-                    TransferReceiver(transport, storage)
+                    TransferReceiver(storage)
                         .receive(listener) { TransferDecision.Accept }
                         .toList()
                 }
@@ -287,7 +291,7 @@ class TransferReceiverTest {
                 }
 
                 assertFailsWith<FluxShareError.ProtocolViolation> {
-                    TransferReceiver(transport, storage)
+                    TransferReceiver(storage)
                         .receive(listener) { TransferDecision.Accept }
                         .toList()
                 }
@@ -317,7 +321,7 @@ class TransferReceiverTest {
                 }
 
                 assertFailsWith<FluxShareError.ProtocolViolation> {
-                    TransferReceiver(transport, storage)
+                    TransferReceiver(storage)
                         .receive(listener) { TransferDecision.Accept }
                         .toList()
                 }
@@ -348,12 +352,200 @@ class TransferReceiverTest {
                 }
 
                 assertFailsWith<FluxShareError.ProtocolViolation> {
-                    TransferReceiver(transport, storage)
+                    TransferReceiver(storage)
                         .receive(listener) { TransferDecision.Accept }
                         .toList()
                 }
                 peer.await()
                 assertTrue(storage.createdSinks.isEmpty())
+            } finally {
+                listener.close()
+            }
+        }
+    }
+
+    @Test
+    fun `zero length data frame is rejected as a protocol violation`() = runBlocking {
+        withTimeout(20_000) {
+            val transport = TcpTransport()
+            val listener = transport.listen(0).requireSuccess("listen")
+            val storage = FakeStorage()
+            val manifest = manifestOf(entryOf("file.bin", 10))
+            try {
+                val peer = startClient(transport, listener.endpoint.port) { remote ->
+                    remote.greet()
+                    remote.offer(manifest)
+                    remote.expectFrame<FluxFrame.ManifestResponse>()
+                    remote.session.write(emptyDataFrame())
+                    val error = remote.expectFrame<FluxFrame.Error>()
+                    assertEquals(ProtocolErrorCode.PROTOCOL_VIOLATION, error.code)
+                }
+
+                assertFailsWith<FluxShareError.ProtocolViolation> {
+                    TransferReceiver(storage)
+                        .receive(listener) { TransferDecision.Accept }
+                        .toList()
+                }
+                peer.await()
+                assertTrue(storage.createdSinks.isEmpty())
+            } finally {
+                listener.close()
+            }
+        }
+    }
+
+    @Test
+    fun `storage failure creating a sink reports TRANSFER_FAILED`() = runBlocking {
+        withTimeout(20_000) {
+            val transport = TcpTransport()
+            val listener = transport.listen(0).requireSuccess("listen")
+            val storage = FakeStorage().apply { failCreateSink = IOException("no space") }
+            val manifest = manifestOf(entryOf("file.bin", 32))
+            try {
+                val peer = startClient(transport, listener.endpoint.port) { remote ->
+                    remote.greet()
+                    remote.offer(manifest)
+                    remote.expectFrame<FluxFrame.ManifestResponse>()
+                    remote.stream.write(FluxFrame.Data(0, 0L, patterned(32, seed = 1)))
+                    val error = remote.expectFrame<FluxFrame.Error>()
+                    assertEquals(ProtocolErrorCode.TRANSFER_FAILED, error.code)
+                }
+
+                val progress = mutableListOf<TransferProgress>()
+                assertFailsWith<FluxShareError.StorageUnavailable> {
+                    TransferReceiver(storage)
+                        .receive(listener) { TransferDecision.Accept }
+                        .collect { progress += it }
+                }
+                peer.await()
+
+                assertEquals(TransferState.FAILED, progress.last().state)
+                assertTrue(progress.none { it.state == TransferState.COMPLETED })
+            } finally {
+                listener.close()
+            }
+        }
+    }
+
+    @Test
+    fun `storage failure writing reports TRANSFER_FAILED and closes the sink`() = runBlocking {
+        withTimeout(20_000) {
+            val transport = TcpTransport()
+            val listener = transport.listen(0).requireSuccess("listen")
+            val storage = FakeStorage().apply { failWrite = IOException("disk full") }
+            val manifest = manifestOf(entryOf("file.bin", 32))
+            try {
+                val peer = startClient(transport, listener.endpoint.port) { remote ->
+                    remote.greet()
+                    remote.offer(manifest)
+                    remote.expectFrame<FluxFrame.ManifestResponse>()
+                    remote.stream.write(FluxFrame.Data(0, 0L, patterned(32, seed = 1)))
+                    val error = remote.expectFrame<FluxFrame.Error>()
+                    assertEquals(ProtocolErrorCode.TRANSFER_FAILED, error.code)
+                }
+
+                val progress = mutableListOf<TransferProgress>()
+                assertFailsWith<FluxShareError.StorageUnavailable> {
+                    TransferReceiver(storage)
+                        .receive(listener) { TransferDecision.Accept }
+                        .collect { progress += it }
+                }
+                peer.await()
+
+                assertEquals(TransferState.FAILED, progress.last().state)
+                assertTrue(storage.allSinksClosed, "a failed write must still close the sink")
+            } finally {
+                listener.close()
+            }
+        }
+    }
+
+    @Test
+    fun `times out waiting for the hello`() = runBlocking {
+        withTimeout(20_000) {
+            val transport = TcpTransport()
+            val listener = transport.listen(0).requireSuccess("listen")
+            val storage = FakeStorage()
+            try {
+                val peer = startClient(transport, listener.endpoint.port) { remote ->
+                    // Connect and stay silent.
+                    remote.drain()
+                }
+
+                assertFailsWith<FluxShareError.PeerUnavailable> {
+                    TransferReceiver(storage, handshakeTimeoutMillis = 200)
+                        .receive(listener) { TransferDecision.Accept }
+                        .toList()
+                }
+                peer.await()
+                assertTrue(storage.createdSinks.isEmpty())
+            } finally {
+                listener.close()
+            }
+        }
+    }
+
+    @Test
+    fun `times out when the data phase goes idle`() = runBlocking {
+        withTimeout(20_000) {
+            val transport = TcpTransport()
+            val listener = transport.listen(0).requireSuccess("listen")
+            val storage = FakeStorage()
+            val manifest = manifestOf(entryOf("file.bin", 64))
+            try {
+                val peer = startClient(transport, listener.endpoint.port) { remote ->
+                    remote.greet()
+                    remote.offer(manifest)
+                    remote.expectFrame<FluxFrame.ManifestResponse>()
+                    // Keep the session open without sending any file content.
+                    remote.drain()
+                }
+
+                val progress = mutableListOf<TransferProgress>()
+                assertFailsWith<FluxShareError.PeerUnavailable> {
+                    TransferReceiver(storage, dataIdleTimeoutMillis = 200)
+                        .receive(listener) { TransferDecision.Accept }
+                        .collect { progress += it }
+                }
+                peer.await()
+
+                assertEquals(TransferState.FAILED, progress.last().state)
+                assertTrue(progress.none { it.state == TransferState.COMPLETED })
+            } finally {
+                listener.close()
+            }
+        }
+    }
+
+    @Test
+    fun `approval time is not counted against the data idle timeout`() = runBlocking {
+        withTimeout(20_000) {
+            val transport = TcpTransport()
+            val listener = transport.listen(0).requireSuccess("listen")
+            val storage = FakeStorage()
+            val payload = patterned(512, seed = 7)
+            val manifest = manifestOf(entryOf("file.bin", payload.size.toLong()))
+            try {
+                val peer = startClient(transport, listener.endpoint.port) { remote ->
+                    remote.greet()
+                    remote.offer(manifest)
+                    remote.expectFrame<FluxFrame.ManifestResponse>()
+                    remote.sendBytes(0, payload)
+                    remote.expectFrame<FluxFrame.TransferComplete>()
+                }
+
+                val progress = async(Dispatchers.IO) {
+                    TransferReceiver(storage, dataIdleTimeoutMillis = 200)
+                        .receive(listener) {
+                            delay(500)
+                            TransferDecision.Accept
+                        }
+                        .toList()
+                }.await()
+                peer.await()
+
+                assertEquals(TransferState.COMPLETED, progress.last().state)
+                assertContentEquals(payload, storage.received("file.bin"))
             } finally {
                 listener.close()
             }
@@ -383,7 +575,7 @@ class TransferReceiverTest {
                 val progress = mutableListOf<TransferProgress>()
                 val sawData = CompletableDeferred<Unit>()
                 val collector = launch(Dispatchers.IO) {
-                    TransferReceiver(transport, storage)
+                    TransferReceiver(storage)
                         .receive(listener) { TransferDecision.Accept }
                         .collect { sample ->
                             progress += sample

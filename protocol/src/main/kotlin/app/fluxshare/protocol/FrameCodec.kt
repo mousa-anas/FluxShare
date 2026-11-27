@@ -26,6 +26,9 @@ enum class FrameType(val id: Int) {
     DATA(0x04),
     FILE_DIGEST(0x05),
     ERROR(0x06),
+
+    /** Confirms that the receiver verified every file. Added in protocol version 1. */
+    TRANSFER_COMPLETE(0x07),
     ;
 
     companion object {
@@ -121,12 +124,21 @@ object FluxFrameCodec {
         return decodePayload(header.type, payload)
     }
 
+    private fun readTransferId(reader: PayloadReader): app.fluxshare.core.TransferId = try {
+        app.fluxshare.core.TransferId(
+            reader.readString(ProtocolLimits.MAX_TRANSFER_ID_BYTES, "transfer identifier"),
+        )
+    } catch (e: IllegalArgumentException) {
+        throw FluxShareError.ProtocolViolation("Transfer identifier is invalid: ${e.message}")
+    }
+
     private fun FluxFrame.type(): FrameType = when (this) {
         is FluxFrame.Hello -> FrameType.HELLO
         is FluxFrame.Manifest -> FrameType.MANIFEST
         is FluxFrame.ManifestResponse -> FrameType.MANIFEST_RESPONSE
         is FluxFrame.Data -> FrameType.DATA
         is FluxFrame.FileDigest -> FrameType.FILE_DIGEST
+        is FluxFrame.TransferComplete -> FrameType.TRANSFER_COMPLETE
         is FluxFrame.Error -> FrameType.ERROR
     }
 
@@ -174,6 +186,14 @@ object FluxFrameCodec {
                 writer.writeOptionalDigest(frame.sha256, "digest")
             }
 
+            is FluxFrame.TransferComplete -> {
+                writer.writeString(
+                    frame.transferId.value,
+                    ProtocolLimits.MAX_TRANSFER_ID_BYTES,
+                    "transfer identifier",
+                )
+            }
+
             is FluxFrame.Error -> {
                 writer.writeByte(frame.code.id)
                 writer.writeOptionalString(
@@ -211,13 +231,7 @@ object FluxFrameCodec {
             FrameType.MANIFEST -> error("Manifest frames are decoded before the shared reader")
 
             FrameType.MANIFEST_RESPONSE -> {
-                val transferId = try {
-                    app.fluxshare.core.TransferId(
-                        reader.readString(ProtocolLimits.MAX_TRANSFER_ID_BYTES, "transfer identifier"),
-                    )
-                } catch (e: IllegalArgumentException) {
-                    throw FluxShareError.ProtocolViolation("Transfer identifier is invalid: ${e.message}")
-                }
+                val transferId = readTransferId(reader)
                 val accepted = reader.readFlag("accepted")
                 val reason = reader.readOptionalString(ProtocolLimits.MAX_TEXT_BYTES, "reason")
                 FluxFrame.ManifestResponse(transferId, accepted, reason)
@@ -248,6 +262,8 @@ object FluxFrameCodec {
                     ?: throw FluxShareError.ProtocolViolation("File digest frame has no digest.")
                 FluxFrame.FileDigest(fileIndex, digest)
             }
+
+            FrameType.TRANSFER_COMPLETE -> FluxFrame.TransferComplete(readTransferId(reader))
 
             FrameType.ERROR -> {
                 val code = ProtocolErrorCode.fromId(reader.readByte("error code"))

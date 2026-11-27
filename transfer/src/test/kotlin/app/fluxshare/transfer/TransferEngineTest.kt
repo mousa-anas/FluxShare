@@ -15,6 +15,7 @@ import kotlinx.coroutines.flow.toList
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
+import java.io.IOException
 import kotlin.test.Test
 import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
@@ -25,7 +26,7 @@ import kotlin.test.assertTrue
 class TransferEngineTest {
 
     @Test
-    fun `sends multiple files and completes only after the receiver closes`() = runBlocking {
+    fun `sends multiple files and completes only after the receiver confirms`() = runBlocking {
         withTimeout(20_000) {
             val alpha = "alpha content".toByteArray()
             val beta = patterned(1500, seed = 7)
@@ -60,6 +61,7 @@ class TransferEngineTest {
                     assertContentEquals(IncrementalSha256.of(alpha), received[0].digest)
                     assertContentEquals(IncrementalSha256.of(beta), received[1].digest)
                     assertEquals(listOf(1024, 476), received[1].chunkSizes)
+                    remote.confirm(manifest)
                 }
 
                 val progress = engine(storage, listener.endpoint.port)
@@ -108,6 +110,7 @@ class TransferEngineTest {
                     assertEquals(0, received.bytes.size)
                     assertEquals(emptyList(), received.chunkSizes)
                     assertContentEquals(IncrementalSha256.of(ByteArray(0)), received.digest)
+                    remote.confirm(manifest)
                 }
 
                 val progress = engine(storage, listener.endpoint.port)
@@ -146,6 +149,7 @@ class TransferEngineTest {
                         received.chunkSizes,
                     )
                     assertContentEquals(payload, received.bytes)
+                    remote.confirm(manifest)
                 }
 
                 val progress = engineWithDefaults(storage, listener.endpoint.port)
@@ -238,6 +242,45 @@ class TransferEngineTest {
     }
 
     @Test
+    fun `clean close without TransferComplete fails instead of completing`() = runBlocking {
+        withTimeout(20_000) {
+            val payload = patterned(4096, seed = 12)
+            val storage = FakeStorage().apply { addFile("payload", payload) }
+            val files = listOf(TransferFile("payload", "payload.bin", payload.size.toLong()))
+            val listener = TcpTransport().listen(0).requireSuccess("listen")
+            try {
+                val peer = startPeer(listener) { remote ->
+                    remote.expectFrame<FluxFrame.Hello>()
+                    val manifest = remote.expectFrame<FluxFrame.Manifest>().manifest
+                    remote.stream.write(
+                        FluxFrame.ManifestResponse(manifest.transferId, accepted = true),
+                    )
+                    remote.receiveAll(1)
+                    // Return without confirming: the session closes silently.
+                }
+
+                val progress = mutableListOf<TransferProgress>()
+                val error = assertFailsWith<FluxShareError.Unexpected> {
+                    engine(storage, listener.endpoint.port)
+                        .execute(requestOf(files))
+                        .collect { progress += it }
+                }
+                peer.await()
+
+                assertTrue(
+                    error.message.orEmpty().contains("confirmation"),
+                    "expected a missing-confirmation failure, was: ${error.message}",
+                )
+                assertEquals(TransferState.FAILED, progress.last().state)
+                assertTrue(progress.none { it.state == TransferState.COMPLETED })
+                assertTrue(storage.allSourcesClosed)
+            } finally {
+                listener.close()
+            }
+        }
+    }
+
+    @Test
     fun `disconnect while sending never reports success`() = runBlocking {
         withTimeout(30_000) {
             // Larger than any socket buffer, so the sender really notices the
@@ -316,6 +359,144 @@ class TransferEngineTest {
         }
     }
 
+    @Test
+    fun `storage failure while opening a source fails with StorageUnavailable`() = runBlocking {
+        withTimeout(20_000) {
+            val storage = FakeStorage().apply {
+                addFile("payload", "payload".toByteArray())
+                failOpenSource = IOException("content resolver died")
+            }
+            val files = listOf(TransferFile("payload", "payload.bin", 7))
+            val listener = TcpTransport().listen(0).requireSuccess("listen")
+            try {
+                val peer = startPeer(listener) { remote ->
+                    remote.expectFrame<FluxFrame.Hello>()
+                    val manifest = remote.expectFrame<FluxFrame.Manifest>().manifest
+                    remote.stream.write(
+                        FluxFrame.ManifestResponse(manifest.transferId, accepted = true),
+                    )
+                    remote.drain()
+                }
+
+                val progress = mutableListOf<TransferProgress>()
+                assertFailsWith<FluxShareError.StorageUnavailable> {
+                    engine(storage, listener.endpoint.port)
+                        .execute(requestOf(files))
+                        .collect { progress += it }
+                }
+                peer.await()
+
+                assertEquals(TransferState.FAILED, progress.last().state)
+                assertTrue(progress.none { it.state == TransferState.COMPLETED })
+            } finally {
+                listener.close()
+            }
+        }
+    }
+
+    @Test
+    fun `storage failure while reading fails with StorageUnavailable`() = runBlocking {
+        withTimeout(20_000) {
+            val storage = FakeStorage().apply {
+                addFile("payload", patterned(4096, seed = 1))
+                failRead = IOException("read failed")
+            }
+            val files = listOf(TransferFile("payload", "payload.bin", 4096))
+            val listener = TcpTransport().listen(0).requireSuccess("listen")
+            try {
+                val peer = startPeer(listener) { remote ->
+                    remote.expectFrame<FluxFrame.Hello>()
+                    val manifest = remote.expectFrame<FluxFrame.Manifest>().manifest
+                    remote.stream.write(
+                        FluxFrame.ManifestResponse(manifest.transferId, accepted = true),
+                    )
+                    remote.drain()
+                }
+
+                val progress = mutableListOf<TransferProgress>()
+                assertFailsWith<FluxShareError.StorageUnavailable> {
+                    engine(storage, listener.endpoint.port)
+                        .execute(requestOf(files))
+                        .collect { progress += it }
+                }
+                peer.await()
+
+                assertEquals(TransferState.FAILED, progress.last().state)
+                assertTrue(progress.none { it.state == TransferState.COMPLETED })
+                assertTrue(storage.allSourcesClosed, "a failed read must still close the source")
+            } finally {
+                listener.close()
+            }
+        }
+    }
+
+    @Test
+    fun `times out waiting for the manifest decision`() = runBlocking {
+        withTimeout(20_000) {
+            val storage = FakeStorage().apply { addFile("payload", "payload".toByteArray()) }
+            val files = listOf(TransferFile("payload", "payload.bin", 7))
+            val listener = TcpTransport().listen(0).requireSuccess("listen")
+            try {
+                val peer = startPeer(listener) { remote ->
+                    remote.expectFrame<FluxFrame.Hello>()
+                    remote.expectFrame<FluxFrame.Manifest>()
+                    // Never decide; the sender must give up and close.
+                    remote.drain()
+                }
+
+                val progress = mutableListOf<TransferProgress>()
+                assertFailsWith<FluxShareError.PeerUnavailable> {
+                    engine(storage, listener.endpoint.port, approvalTimeoutMillis = 200)
+                        .execute(requestOf(files))
+                        .collect { progress += it }
+                }
+                peer.await()
+
+                assertEquals(TransferState.FAILED, progress.last().state)
+                assertTrue(progress.none { it.state == TransferState.COMPLETED })
+                assertTrue(storage.openedSources.isEmpty())
+            } finally {
+                listener.close()
+            }
+        }
+    }
+
+    @Test
+    fun `times out waiting for the final confirmation`() = runBlocking {
+        withTimeout(20_000) {
+            val storage = FakeStorage().apply { addFile("payload", patterned(2048, seed = 2)) }
+            val files = listOf(TransferFile("payload", "payload.bin", 2048))
+            val listener = TcpTransport().listen(0).requireSuccess("listen")
+            try {
+                val peer = startPeer(listener) { remote ->
+                    remote.expectFrame<FluxFrame.Hello>()
+                    val manifest = remote.expectFrame<FluxFrame.Manifest>().manifest
+                    remote.stream.write(
+                        FluxFrame.ManifestResponse(manifest.transferId, accepted = true),
+                    )
+                    remote.receiveAll(1)
+                    // Keep the session open but never confirm.
+                    remote.drain()
+                }
+
+                val progress = mutableListOf<TransferProgress>()
+                assertFailsWith<FluxShareError.PeerUnavailable> {
+                    engine(
+                        storage = storage,
+                        port = listener.endpoint.port,
+                        dataIdleTimeoutMillis = 200,
+                    ).execute(requestOf(files)).collect { progress += it }
+                }
+                peer.await()
+
+                assertEquals(TransferState.FAILED, progress.last().state)
+                assertTrue(progress.none { it.state == TransferState.COMPLETED })
+            } finally {
+                listener.close()
+            }
+        }
+    }
+
     private fun requestOf(files: List<TransferFile>) = TransferRequest(
         peer = REMOTE_DEVICE,
         direction = TransferDirection.SEND,
@@ -326,6 +507,8 @@ class TransferEngineTest {
         storage: StorageProvider,
         port: Int,
         chunkSizeBytes: Int = 1024,
+        approvalTimeoutMillis: Long = DefaultTransferEngine.DEFAULT_APPROVAL_TIMEOUT_MILLIS,
+        dataIdleTimeoutMillis: Long = DefaultTransferEngine.DEFAULT_DATA_IDLE_TIMEOUT_MILLIS,
     ) = DefaultTransferEngine(
         transport = TcpTransport(),
         storage = storage,
@@ -334,6 +517,8 @@ class TransferEngineTest {
             FluxShareResult.Success(TransportEndpoint("127.0.0.1", port))
         },
         chunkSizeBytes = chunkSizeBytes,
+        approvalTimeoutMillis = approvalTimeoutMillis,
+        dataIdleTimeoutMillis = dataIdleTimeoutMillis,
     )
 
     private fun engineWithDefaults(storage: StorageProvider, port: Int) = DefaultTransferEngine(

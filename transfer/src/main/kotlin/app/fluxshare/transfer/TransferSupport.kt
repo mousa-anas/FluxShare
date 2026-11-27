@@ -7,10 +7,15 @@ import app.fluxshare.protocol.FluxFrameStream
 import app.fluxshare.protocol.ProtocolErrorCode
 import app.fluxshare.protocol.ProtocolLimits
 import app.fluxshare.transport.TransportSession
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.channels.SendChannel
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.util.concurrent.atomic.AtomicBoolean
 
 /** Returns the value of a successful result, or throws its error. */
 internal fun <T> FluxShareResult<T>.orThrow(): T = when (this) {
@@ -148,6 +153,104 @@ internal suspend fun FluxFrameStream.writeErrorQuietly(
     message: String?,
 ) {
     runCatching { write(FluxFrame.Error(code, message.toWireText())) }
+}
+
+/**
+ * Runs a storage call, mapping platform failures onto
+ * [FluxShareError.StorageUnavailable].
+ *
+ * Real providers throw `IOException`, `SecurityException` and friends; the
+ * transfer layer must never leak those, and cancellation must never be
+ * swallowed.
+ */
+internal suspend fun <T> storageCall(block: suspend () -> T): T {
+    return try {
+        block()
+    } catch (e: CancellationException) {
+        throw e
+    } catch (e: FluxShareError) {
+        throw e
+    } catch (e: Exception) {
+        throw FluxShareError.StorageUnavailable
+    }
+}
+
+/**
+ * Runs [block] and closes its source or sink afterwards.
+ *
+ * A close failure after a successful body is a storage failure; on the failure
+ * path the original error wins and the close is best-effort.
+ */
+internal suspend fun <T> withStorageClose(
+    close: suspend () -> Unit,
+    block: suspend () -> T,
+): T {
+    var succeeded = false
+    try {
+        val result = block()
+        succeeded = true
+        return result
+    } finally {
+        withContext(NonCancellable) {
+            if (succeeded) storageCall { close() } else runCatching { close() }
+        }
+    }
+}
+
+/** An engine-level timeout expired; the session has already been closed. */
+internal class TransferTimeoutException : Exception("The peer did not respond in time.")
+
+/**
+ * Runs [block] under an application-level timeout.
+ *
+ * Socket reads block in native code and ignore coroutine cancellation, so the
+ * watchdog closes the session on expiry; the blocked read then ends and the
+ * failure surfaces as [TransferTimeoutException].
+ */
+internal suspend fun <T> withTransferTimeout(
+    timeoutMillis: Long,
+    session: TransportSession,
+    block: suspend () -> T,
+): T = coroutineScope {
+    val expired = AtomicBoolean(false)
+    val watchdog = launch {
+        delay(timeoutMillis)
+        expired.set(true)
+        runCatching { session.close() }
+    }
+
+    val result = try {
+        block()
+    } catch (e: CancellationException) {
+        throw e
+    } catch (e: Exception) {
+        if (expired.get()) throw TransferTimeoutException() else throw e
+    } finally {
+        watchdog.cancel()
+    }
+
+    if (expired.get()) throw TransferTimeoutException()
+    result
+}
+
+/** Maps a worker exception onto the failure the caller should see. */
+internal fun Exception.toTransferFailure(): FluxShareError = when (this) {
+    is FluxShareError -> this
+    is TransferTimeoutException -> FluxShareError.PeerUnavailable
+    else -> FluxShareError.Unexpected(message ?: this::class.simpleName ?: "Unexpected failure")
+}
+
+/** Maps a receiver exception onto its failure and the error frame to send back. */
+internal fun Exception.toReceiverFailure(): Pair<FluxShareError, ProtocolErrorCode?> = when (this) {
+    is ReceiverFailure -> error to reply
+    is TransferTimeoutException -> FluxShareError.PeerUnavailable to null
+    is FluxShareError -> this to when (this) {
+        is FluxShareError.ProtocolViolation -> ProtocolErrorCode.PROTOCOL_VIOLATION
+        else -> ProtocolErrorCode.TRANSFER_FAILED
+    }
+
+    else -> FluxShareError.Unexpected(message ?: this::class.simpleName ?: "Unexpected failure") to
+        ProtocolErrorCode.TRANSFER_FAILED
 }
 
 /** Reads the next frame and requires it to be a [T]. */
