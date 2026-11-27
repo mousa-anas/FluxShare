@@ -21,5 +21,15 @@ dependencies {
     api(project(":transport"))
     api(project(":security"))
     api(project(":storage"))
+    api(project(":protocol"))
     api(libs.kotlinx.coroutines.core)
+
+    testImplementation(kotlin("test"))
+    testImplementation(libs.kotlinx.coroutines.core)
+    testImplementation(libs.junit.jupiter)
+    testRuntimeOnly(libs.junit.platform.launcher)
+}
+
+tasks.test {
+    useJUnitPlatform()
 }
