@@ -15,6 +15,15 @@ sealed class FluxShareError(message: String) : Exception(message) {
 
     data object SecurityFailure : FluxShareError("The secure channel could not be established.")
 
+    /**
+     * A device that was paired before presented a different identity certificate.
+     *
+     * This is never a prompt: it either means the peer reinstalled FluxShare or
+     * that somebody is impersonating it, so the session must fail and the user
+     * has to pair again out of band.
+     */
+    data class PeerIdentityChanged(val detail: String) : FluxShareError(detail)
+
     data object StorageUnavailable : FluxShareError("The file could not be read or written.")
 
     /** A peer sent bytes that do not satisfy the FluxShare protocol. */

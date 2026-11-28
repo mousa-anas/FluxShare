@@ -48,9 +48,20 @@ Manifests describe flat file names only. Absolute paths, path separators, `.`/`.
 - Only the JVM-side TCP transport exists; Android integration (foreground service, discovery) comes later.
 - The `:transfer` module implements the sender and receiver engines, but the app UI does not drive them yet; they are currently exercised by JVM tests.
 
+## Phase 3: authenticated and encrypted sessions
+
+The `:security` module wraps a raw `TransportSession` in JDK TLS (`SSLEngine`) with mutual authentication based on self-signed X.509 identities. It implements no cryptography of its own; Bouncy Castle is used only to encode identity certificates.
+
+- Each device has an ECDSA P-256 self-signed certificate that carries its `DeviceId` in a `fluxshare:device:<id>` SAN and is identified by the SHA-256 fingerprint of its DER encoding.
+- Peers are pinned by fingerprint. A known device presenting a different certificate fails hard (`PeerIdentityChanged`); an unknown device is paired by comparing a ten-digit code derived from both fingerprints, or by scanning a `fluxshare://pair?id=<deviceId>&fp=<hex>` link.
+- Mutual TLS: the server requires a client certificate. Only TLS 1.3 and TLS 1.2 with AEAD suites are enabled. Trust is decided after the handshake and before any application data is exchanged.
+- The transfer engines are not wired to `:security` yet; that is Phase 3 part 2.
+
+See [`security/README.md`](security/README.md) for the threat model and design.
+
 ### Tests
 
-Focused JVM tests live in `protocol/src/test`, `transport/src/test` and `transfer/src/test` and run with `./gradlew :protocol:test :transport:test :transfer:test`.
+Focused JVM tests live in `protocol/src/test`, `transport/src/test`, `security/src/test` and `transfer/src/test` and run with `./gradlew :protocol:test :transport:test :security:test :transfer:test`.
 
 ## License
 
