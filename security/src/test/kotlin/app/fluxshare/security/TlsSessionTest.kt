@@ -156,7 +156,7 @@ class TlsSessionTest {
             val result = security.secure(silent, DeviceId("silent-peer"))
 
             assertTrue(result is FluxShareResult.Failure, "Expected failure but was $result")
-            assertTrue((result as FluxShareResult.Failure).error == FluxShareError.SecurityFailure)
+            assertTrue(result.error == FluxShareError.SecurityFailure)
             assertFalse(silent.isOpen, "The timed-out session must be closed")
         }
     }

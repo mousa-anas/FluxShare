@@ -1,4 +1,5 @@
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
+import java.time.Duration
 
 plugins {
     `java-library`
@@ -32,4 +33,7 @@ dependencies {
 
 tasks.test {
     useJUnitPlatform()
+    maxHeapSize = "512m"
+    maxParallelForks = 1
+    timeout.set(Duration.ofMinutes(5))
 }
